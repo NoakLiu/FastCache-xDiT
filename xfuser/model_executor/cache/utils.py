@@ -342,6 +342,12 @@ class FastCachedTransformerBlocks(CachedTransformerBlocks):
         self.enable_adacorrection = enable_adacorrection
         self.adacorr_gamma = adacorr_gamma
         self.adacorr_lambda = adacorr_lambda
+        
+        # AdaCorrection cache storage for per-layer cached outputs
+        if self.enable_adacorrection:
+            self.register_buffer("adacorr_cache", None, persistent=False)
+            self.register_buffer("adacorr_cache_timestep", None, persistent=False)
+            print(f"AdaCorrection enabled with gamma={adacorr_gamma}, lambda={adacorr_lambda}")
 
     def get_chi2_threshold(self, n, d, alpha):
         """计算卡方分布阈值 χ²_{ND, 1-α}"""
@@ -438,21 +444,42 @@ class FastCachedTransformerBlocks(CachedTransformerBlocks):
         return motion_hidden, motion_encoder, static_hidden, static_encoder, motion_mask, static_mask
 
     def compute_adacorr_offset_score(self, current_hidden: torch.Tensor, prev_hidden: torch.Tensor) -> torch.Tensor:
-        """计算 AdaCorrection 的偏移分数 S_t^l = Δ_temp + λ * Δ_spatial
-        - Δ_temp: 跨时间步的均方变化（按 batch 与 token 平均）
-        - Δ_spatial: 当前时间步在通道维的离散度（按 batch 与 token 平均）
-        返回标量张量
+        """
+        Compute AdaCorrection offset score S_t^l according to the paper:
+        
+        S_t^l = ||Δ_temp(t)||^2 + λ * ||∇_x h_t^l||^2
+        
+        Where:
+        - Δ_temp(t) = (1/BP) * Σ_{b,i} ||h_t^l[b,i,:] - h_{t-1}^l[b,i,:]||_2  (temporal deviation)
+        - ||∇_x h_t^l||^2 ≈ Δ_spatial(t) = (1/BP) * Σ_{b,i} sqrt(Var_d(h_t^l[b,i,d]))  (spatial variation)
+        
+        Args:
+            current_hidden: h_t^l ∈ R^{B×P×D} - current hidden state at layer l, timestep t
+            prev_hidden: h_{t-1}^l ∈ R^{B×P×D} - previous hidden state at layer l, timestep t-1
+            
+        Returns:
+            S_t^l: offset score (scalar tensor)
         """
         if prev_hidden is None:
             return torch.tensor(0.0, device=current_hidden.device)
-        # 形状期望: [B, N, D]
-        diff_sq = (current_hidden - prev_hidden) ** 2
-        delta_temp = diff_sq.mean()  # 标量
-        # 通道维方差的平方根后再平均以近似复杂度
-        # 避免数值问题，添加微小项
-        spatial_var = current_hidden.var(dim=-1, unbiased=False)  # [B, N]
-        delta_spatial = (spatial_var.clamp_min(1e-12).sqrt()).mean()  # 标量
-        score = delta_temp + self.adacorr_lambda * delta_spatial
+        
+        B, P, D = current_hidden.shape
+        
+        # Compute temporal deviation: Δ_temp(t) = (1/BP) * Σ ||h_t[b,i,:] - h_{t-1}[b,i,:]||_2
+        # For each token [b,i], compute L2 norm across channel dimension
+        token_diff = current_hidden - prev_hidden  # [B, P, D]
+        token_diff_norm = torch.norm(token_diff, p=2, dim=-1)  # [B, P] - L2 norm per token
+        delta_temp = token_diff_norm.mean()  # scalar: average across all tokens
+        
+        # Compute spatial variation: Δ_spatial(t) = (1/BP) * Σ sqrt(Var_d(h_t[b,i,d]))
+        # For each token [b,i], compute variance across channel dimension, then take sqrt
+        spatial_var = current_hidden.var(dim=-1, unbiased=False)  # [B, P] - variance per token
+        delta_spatial = torch.sqrt(spatial_var.clamp_min(1e-12)).mean()  # scalar: sqrt of variance, then average
+        
+        # Compute offset score: S_t^l = ||Δ_temp(t)||^2 + λ * ||∇_x h_t^l||^2
+        # According to paper, ||∇_x h_t^l||^2 is approximated by Δ_spatial(t)
+        score = (delta_temp ** 2) + self.adacorr_lambda * delta_spatial
+        
         return score
 
     def blend_with_adacorrection(self, cached_hidden: torch.Tensor, fresh_hidden: torch.Tensor, offset_score: torch.Tensor) -> torch.Tensor:
@@ -681,15 +708,43 @@ class FastCachedTransformerBlocks(CachedTransformerBlocks):
         return self.process_transformer_blocks(start_idx, hidden, encoder, *args, **kwargs)
     
     def process_transformer_blocks(self, start_idx: int, hidden: torch.Tensor, encoder: torch.Tensor, *args, **kwargs):
-        """Process hidden states through transformer blocks with per-block caching"""
+        """Process hidden states through transformer blocks with per-block caching and optional AdaCorrection"""
         current_hidden, current_encoder = hidden, encoder
+        prev_hidden = self.cache_context.prev_hidden_states
         
         # 对每个transformer块分别决定是否使用缓存
         for i, block in enumerate(self.transformer_blocks[start_idx:], start=start_idx):
-            # 如果有previous hidden states，计算相对变化并决定是否使用缓存
-            if self.cache_context.prev_hidden_states is not None:
+            # 如果启用AdaCorrection，使用自适应混合策略
+            if self.enable_adacorrection and prev_hidden is not None:
+                # 计算cached路径（线性近似）
+                cached_hidden = self.block_projections[i](current_hidden)
+                
+                # 计算fresh路径（完整transformer块）
+                fresh_hidden, fresh_encoder = block(current_hidden, current_encoder, *args, **kwargs)
+                fresh_hidden, fresh_encoder = (fresh_hidden, fresh_encoder) if self.return_hidden_states_first else (fresh_encoder, fresh_hidden)
+                
+                # 计算offset score S_t^l
+                offset_score = self.compute_adacorr_offset_score(current_hidden, prev_hidden)
+                
+                # 计算correction weight λ_t^l = clip(γ * S_t^l, 0, 1)
+                correction_weight = torch.clamp(self.adacorr_gamma * offset_score, 0.0, 1.0)
+                
+                # 自适应混合: ĥ_{t,l+1} = (1 - λ_t^l) * h̃_{t,l+1} + λ_t^l * h_{t,l+1}
+                # 将correction_weight广播到hidden的维度
+                if correction_weight.dim() == 0:
+                    correction_weight = correction_weight.view(1, 1, 1)
+                elif correction_weight.dim() == 1:
+                    correction_weight = correction_weight.view(-1, 1, 1)
+                
+                current_hidden = (1 - correction_weight) * cached_hidden + correction_weight * fresh_hidden
+                current_encoder = fresh_encoder
+                
+                # 更新prev_hidden为当前层的输出，用于下一层的计算
+                prev_hidden = current_hidden.detach().clone()
+                
+            # 如果未启用AdaCorrection，使用原有的FastCache逻辑
+            elif prev_hidden is not None:
                 # 计算相对变化
-                prev_hidden = self.cache_context.prev_hidden_states
                 delta = self.compute_relative_change(current_hidden, prev_hidden)
                 
                 # 基于统计检验决定是否使用线性近似（可学习缓存）
@@ -697,11 +752,15 @@ class FastCachedTransformerBlocks(CachedTransformerBlocks):
                     # 使用线性投影近似
                     current_hidden = self.block_projections[i](current_hidden)
                     self.cache_hits += 1
+                    # 更新prev_hidden
+                    prev_hidden = current_hidden.detach().clone()
                     continue
             
-            # 完整执行transformer处理
-            current_hidden, current_encoder = block(current_hidden, current_encoder, *args, **kwargs)
-            current_hidden, current_encoder = (current_hidden, current_encoder) if self.return_hidden_states_first else (current_encoder, current_hidden)
+            # 完整执行transformer处理（当不使用缓存时）
+            if not (self.enable_adacorrection and prev_hidden is not None):
+                current_hidden, current_encoder = block(current_hidden, current_encoder, *args, **kwargs)
+                current_hidden, current_encoder = (current_hidden, current_encoder) if self.return_hidden_states_first else (current_encoder, current_hidden)
+                prev_hidden = current_hidden.detach().clone()
         
         # 处理single_transformer_blocks如果存在
         if self.single_transformer_blocks:
