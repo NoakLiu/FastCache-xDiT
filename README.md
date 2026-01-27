@@ -233,6 +233,30 @@ python examples/run_fastcache_test.py \
 ./examples/run_fastcache_benchmark.sh flux
 ```
 
+#### AdaCorrection: Adaptive Offset Cache Correction
+
+AdaCorrection is a lightweight, training-free framework that improves generation quality by adaptively correcting cache misalignment. It can be used with FastCache or other caching methods:
+
+```bash
+# Test AdaCorrection with FastCache
+python examples/test_adacorrection.py \
+    --model_type flux \
+    --model "black-forest-labs/FLUX.1-schnell" \
+    --prompt "a serene landscape with mountains and a lake" \
+    --num_inference_steps 30 \
+    --enable_adacorrection \
+    --adacorr_gamma 1.0 \
+    --adacorr_lambda 1.0
+```
+
+**Key Features:**
+- Maintains near-original FID scores (4.37 vs 4.42 baseline, only 0.05 difference)
+- Plug-and-play with existing caching methods
+- Minimal computational overhead
+- Improves cache hit rates by 5-9 percentage points
+
+For detailed documentation, see [AdaCorrection Documentation](./docs/methods/adacorrection.md).
+
 #### Enhanced Linear Approximation Algorithm
 
 Test the enhanced Linear Approximation Algorithm:
@@ -265,7 +289,7 @@ python examples/test_enhanced_linear_approx.py \
 python benchmark/cache_execute.py \
   --model_type pixart \
   --cache_methods None Fast Fb Tea \
-  --num_inference_steps 20 \
+--num_inference_steps 20 \
   --height 512 \
   --width 512 \
   --output_dir cache_results

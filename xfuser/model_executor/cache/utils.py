@@ -10,8 +10,10 @@ from xfuser.core.distributed import (
 )
 
 import torch
+import torch.nn.functional as F
 from torch.nn import Module
 from abc import ABC, abstractmethod
+from typing import Tuple, List
 import math
 
 
@@ -272,6 +274,11 @@ class FastCachedTransformerBlocks(CachedTransformerBlocks):
         enable_adacorrection: bool = False,  # 新增：是否启用AdaCorrection
         adacorr_gamma: float = 1.0,          # 新增：灵敏度 γ
         adacorr_lambda: float = 1.0,         # 新增：空间项权重 λ
+        enable_token_merge: bool = False,    # 新增：是否启用Token Merging
+        token_merge_k: int = 5,              # 新增：kNN的K值
+        token_merge_lambda: float = 1.0,     # 新增：时间项权重λ（与adacorr_lambda不同）
+        num_stages: int = 3,                 # 新增：多阶段金字塔编码的stage数量
+        merge_ratio: float = 0.5,            # 新增：每个stage的token合并比例
     ):
         super().__init__(transformer_blocks,
                        single_transformer_blocks=single_transformer_blocks,
@@ -348,6 +355,19 @@ class FastCachedTransformerBlocks(CachedTransformerBlocks):
             self.register_buffer("adacorr_cache", None, persistent=False)
             self.register_buffer("adacorr_cache_timestep", None, persistent=False)
             print(f"AdaCorrection enabled with gamma={adacorr_gamma}, lambda={adacorr_lambda}")
+        
+        # 新增：Token Merging 参数
+        self.enable_token_merge = enable_token_merge
+        self.token_merge_k = token_merge_k
+        self.token_merge_lambda = token_merge_lambda
+        self.num_stages = num_stages
+        self.merge_ratio = merge_ratio
+        
+        # Token merging storage for multi-stage processing
+        if self.enable_token_merge:
+            self.register_buffer("stage_outputs", None, persistent=False)  # Z[s] for each stage
+            self.register_buffer("merge_masks", None, persistent=False)   # M[s] for each stage
+            print(f"Token Merging enabled with K={token_merge_k}, lambda={token_merge_lambda}, stages={num_stages}")
 
     def get_chi2_threshold(self, n, d, alpha):
         """计算卡方分布阈值 χ²_{ND, 1-α}"""
@@ -490,10 +510,371 @@ class FastCachedTransformerBlocks(CachedTransformerBlocks):
             lam = lam.unsqueeze(0)
         return (1 - lam) * cached_hidden + lam * fresh_hidden
 
+    def compute_spatial_density(self, hidden_states: torch.Tensor, k: int = None) -> torch.Tensor:
+        """
+        Compute spatial density ρsp,i for each token using kNN.
+        
+        ρsp,i = exp(-1/K * Σ_{j∈kNN(i)} ||ht,i - ht,j||²)
+        
+        Args:
+            hidden_states: [B, P, D] hidden states
+            k: number of nearest neighbors (default: self.token_merge_k)
+            
+        Returns:
+            ρsp: [B, P] spatial density scores
+        """
+        if k is None:
+            k = self.token_merge_k
+        
+        B, P, D = hidden_states.shape
+        
+        # Reshape to [B*P, D] for efficient pairwise distance computation
+        h_flat = hidden_states.view(B * P, D)  # [B*P, D]
+        
+        # Compute pairwise squared distances: ||ht,i - ht,j||²
+        # Using efficient matrix multiplication: ||a-b||² = ||a||² + ||b||² - 2*a*b
+        h_norm_sq = (h_flat ** 2).sum(dim=-1, keepdim=True)  # [B*P, 1]
+        pairwise_dist_sq = h_norm_sq + h_norm_sq.T - 2 * torch.mm(h_flat, h_flat.T)  # [B*P, B*P]
+        
+        # For each token, find k nearest neighbors (excluding self)
+        # Add large value to diagonal to exclude self
+        pairwise_dist_sq.fill_diagonal_(float('inf'))
+        
+        # Find k nearest neighbors for each token
+        k_nearest_dist_sq, _ = torch.topk(pairwise_dist_sq, k=min(k, P-1), dim=-1, largest=False)  # [B*P, k]
+        
+        # Compute spatial density: ρsp,i = exp(-1/K * Σ ||ht,i - ht,j||²)
+        sum_dist_sq = k_nearest_dist_sq.sum(dim=-1)  # [B*P]
+        rho_sp = torch.exp(-sum_dist_sq / k)  # [B*P]
+        
+        # Reshape back to [B, P]
+        rho_sp = rho_sp.view(B, P)
+        
+        return rho_sp
+
+    def compute_temporal_saliency_tokenwise(self, hidden_states: torch.Tensor, prev_hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Compute token-wise temporal saliency ρtm,i.
+        
+        ρtm,i = ||ht,i - ht-1,i||₂
+        
+        Args:
+            hidden_states: [B, P, D] current hidden states
+            prev_hidden_states: [B, P, D] previous hidden states
+            
+        Returns:
+            ρtm: [B, P] temporal saliency scores
+        """
+        if prev_hidden_states is None:
+            return torch.zeros(hidden_states.shape[:2], device=hidden_states.device)
+        
+        # Compute L2 norm per token: ||ht,i - ht-1,i||₂
+        token_diff = hidden_states - prev_hidden_states  # [B, P, D]
+        rho_tm = torch.norm(token_diff, p=2, dim=-1)  # [B, P]
+        
+        return rho_tm
+
+    def compute_token_importance_score(self, hidden_states: torch.Tensor, prev_hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Compute combined token importance score Si.
+        
+        Si = ρsp,i · (1 + λ · ρtm,i)
+        
+        Args:
+            hidden_states: [B, P, D] current hidden states
+            prev_hidden_states: [B, P, D] previous hidden states
+            
+        Returns:
+            S: [B, P] importance scores
+        """
+        # Compute spatial density
+        rho_sp = self.compute_spatial_density(hidden_states)  # [B, P]
+        
+        # Compute temporal saliency
+        rho_tm = self.compute_temporal_saliency_tokenwise(hidden_states, prev_hidden_states)  # [B, P]
+        
+        # Normalize temporal saliency to [0, 1] range for stability
+        if rho_tm.max() > 0:
+            rho_tm = rho_tm / (rho_tm.max() + 1e-8)
+        
+        # Combined importance score: Si = ρsp,i · (1 + λ · ρtm,i)
+        S = rho_sp * (1 + self.token_merge_lambda * rho_tm)
+        
+        return S
+
+    def local_ctm(self, hidden_states: torch.Tensor, importance_scores: torch.Tensor, target_ratio: float = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Local Clustering-based Token Merge (LocalCTM).
+        
+        Groups tokens into clusters and merges tokens within each cluster via weighted averaging:
+        h̃_k = Σ_{j∈Ck} (Sj * ht,j) / Σ_{j∈Ck} Sj
+        
+        Args:
+            hidden_states: [B, P, D] hidden states to merge
+            importance_scores: [B, P] importance scores S
+            target_ratio: ratio of tokens to keep (default: self.merge_ratio)
+            
+        Returns:
+            merged_hidden: [B, P', D] merged hidden states (P' ≈ P * target_ratio)
+            merge_mask: [B, P] boolean mask indicating which original tokens were kept
+        """
+        if target_ratio is None:
+            target_ratio = self.merge_ratio
+        
+        B, P, D = hidden_states.shape
+        
+        # Determine number of tokens to keep
+        P_target = max(1, int(P * target_ratio))
+        
+        # For simplicity, use importance-based selection: keep top P_target tokens
+        # In a full implementation, this would use clustering (e.g., k-means or hierarchical)
+        _, top_indices = torch.topk(importance_scores, k=P_target, dim=-1)  # [B, P_target]
+        
+        # Create merge mask: True for tokens to keep
+        merge_mask = torch.zeros(B, P, dtype=torch.bool, device=hidden_states.device)
+        for b in range(B):
+            merge_mask[b, top_indices[b]] = True
+        
+        # For kept tokens, use weighted average of their cluster
+        # Simplified: for each kept token, average with its nearest neighbors
+        merged_hidden = hidden_states.clone()
+        
+        # Compute pairwise distances for clustering
+        h_flat = hidden_states.view(B * P, D)
+        h_norm_sq = (h_flat ** 2).sum(dim=-1, keepdim=True)
+        pairwise_dist_sq = h_norm_sq + h_norm_sq.T - 2 * torch.mm(h_flat, h_flat.T)
+        
+        # For each batch
+        for b in range(B):
+            batch_start = b * P
+            batch_end = (b + 1) * P
+            
+            # Get kept token indices for this batch
+            kept_indices = top_indices[b]  # [P_target]
+            
+            # For each kept token, merge with its nearest neighbors
+            for kept_idx in kept_indices:
+                # Find nearest neighbors (including self)
+                global_kept_idx = batch_start + kept_idx.item()
+                dists = pairwise_dist_sq[global_kept_idx, batch_start:batch_end]  # [P]
+                
+                # Find k nearest neighbors
+                k = min(self.token_merge_k, P)
+                _, nn_indices = torch.topk(dists, k=k, largest=False)
+                
+                # Weighted average using importance scores
+                cluster_indices = nn_indices
+                cluster_weights = importance_scores[b, cluster_indices]  # [k]
+                cluster_weights = cluster_weights / (cluster_weights.sum() + 1e-8)
+                
+                # Weighted average: h̃_k = Σ (Sj * ht,j) / Σ Sj
+                merged_token = (hidden_states[b, cluster_indices] * cluster_weights.unsqueeze(-1)).sum(dim=0)  # [D]
+                merged_hidden[b, kept_idx] = merged_token
+        
+        # Select only kept tokens
+        merged_hidden = merged_hidden[merge_mask.view(B, P)].view(B, P_target, D)
+        
+        return merged_hidden, merge_mask
+
+    def unpool_tokens(self, hidden_states: torch.Tensor, merge_mask: torch.Tensor, original_size: int) -> torch.Tensor:
+        """
+        Unpool tokens back to original size using merge mask.
+        
+        This is a simplified unpooling: each merged token is broadcast to its original cluster.
+        
+        Args:
+            hidden_states: [B, P', D] merged hidden states
+            merge_mask: [B, P] boolean mask indicating which original tokens were kept
+            original_size: original number of tokens P
+            
+        Returns:
+            unpooled: [B, P, D] unpooled hidden states
+        """
+        B, P_merged, D = hidden_states.shape
+        P_original = original_size
+        
+        # Create unpooled tensor
+        unpooled = torch.zeros(B, P_original, D, device=hidden_states.device, dtype=hidden_states.dtype)
+        
+        # For each batch, place merged tokens at their original positions
+        for b in range(B):
+            kept_indices = torch.where(merge_mask[b])[0]  # [P_merged]
+            if len(kept_indices) > 0:
+                # Map kept indices to their positions in merged hidden states
+                # Since merge_mask indicates which original tokens were kept,
+                # we need to find the corresponding positions in hidden_states
+                kept_positions = torch.arange(len(kept_indices), device=hidden_states.device)
+                unpooled[b, kept_indices] = hidden_states[b, kept_positions]
+            
+            # For non-kept tokens, use nearest neighbor interpolation
+            if len(kept_indices) < P_original:
+                # Find nearest kept token for each non-kept token
+                non_kept_indices = torch.where(~merge_mask[b])[0]
+                if len(non_kept_indices) > 0 and len(kept_indices) > 0:
+                    # Simple interpolation: use the closest kept token
+                    for non_kept_idx in non_kept_indices:
+                        # Find closest kept token
+                        dists = torch.abs(kept_indices.float() - non_kept_idx.float())
+                        closest_kept_idx = kept_indices[dists.argmin()]
+                        # Find position of closest_kept_idx in kept_indices
+                        closest_pos = (kept_indices == closest_kept_idx).nonzero(as_tuple=True)[0]
+                        if len(closest_pos) > 0:
+                            unpooled[b, non_kept_idx] = hidden_states[b, closest_pos[0]]
+        
+        return unpooled
+
+    def multi_stage_pyramidal_encoding(self, hidden: torch.Tensor, encoder: torch.Tensor, *args, **kwargs) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
+        """
+        Multi-Stage Pyramidal Backbone Encoding with CTM Downsampling.
+        
+        Algorithm 2 Part 1: Pyramidal Backbone Encoding
+        For each stage s = 1 to S:
+            - Process through Ls transformer blocks
+            - Apply CTM downsampling (except last stage)
+            - Store stage output Z[s] and merge mask M[s]
+        
+        Args:
+            hidden: [B, P, D] input hidden states
+            encoder: [B, P, D] encoder hidden states
+            *args, **kwargs: additional arguments for transformer blocks
+            
+        Returns:
+            final_hidden: [B, P_final, D] final hidden states after all stages
+            stage_outputs: List of [B, P_s, D] outputs for each stage Z[s]
+            merge_masks: List of [B, P_s] merge masks M[s] for each stage
+        """
+        B, P_initial, D = hidden.shape
+        prev_hidden = self.cache_context.prev_hidden_states
+        
+        stage_outputs = []
+        merge_masks = []
+        
+        current_hidden = hidden
+        current_encoder = encoder
+        current_size = P_initial
+        
+        # Compute initial token importance score
+        importance_scores = self.compute_token_importance_score(current_hidden, prev_hidden)
+        
+        # Process through S stages
+        for s in range(1, self.num_stages + 1):
+            # Determine number of blocks for this stage (distribute blocks across stages)
+            blocks_per_stage = self.num_layers // self.num_stages
+            start_block = (s - 1) * blocks_per_stage
+            end_block = s * blocks_per_stage if s < self.num_stages else self.num_layers
+            
+            # Process through blocks in this stage
+            for l in range(start_block, end_block):
+                if l < len(self.transformer_blocks):
+                    block = self.transformer_blocks[l]
+                    
+                    # Compute relative change
+                    if prev_hidden is not None:
+                        delta = self.compute_relative_change(current_hidden, prev_hidden)
+                        n, d = current_hidden.shape[0], current_hidden.shape[1]
+                        chi2_threshold = self.get_chi2_threshold(n, d, self.significance_level)
+                        statistical_threshold = math.sqrt(chi2_threshold / (n * d))
+                        
+                        # Decide whether to use linear approximation
+                        if (delta ** 2) <= (chi2_threshold / (n * d)):
+                            # Linear approximation: H_{t,l} = W_{s,l} H_{t,l-1} + b_{s,l}
+                            current_hidden = self.block_projections[l](current_hidden)
+                        else:
+                            # Full computation: H_{t,l} = Blocks,l(H_{t,l-1})
+                            current_hidden, current_encoder = block(current_hidden, current_encoder, *args, **kwargs)
+                            current_hidden, current_encoder = (current_hidden, current_encoder) if self.return_hidden_states_first else (current_encoder, current_hidden)
+                    else:
+                        # First timestep: full computation
+                        current_hidden, current_encoder = block(current_hidden, current_encoder, *args, **kwargs)
+                        current_hidden, current_encoder = (current_hidden, current_encoder) if self.return_hidden_states_first else (current_encoder, current_hidden)
+                    
+                    # Update prev_hidden for next layer
+                    prev_hidden = current_hidden.detach().clone()
+            
+            # Store stage output Z[s] = H_{t,Ls}
+            stage_outputs.append(current_hidden.detach().clone())
+            
+            # CTM Downsampling (except last stage)
+            if s < self.num_stages:
+                # Recompute importance scores for current hidden states
+                importance_scores = self.compute_token_importance_score(current_hidden, prev_hidden)
+                
+                # Apply LocalCTM downsampling
+                current_hidden, merge_mask = self.local_ctm(current_hidden, importance_scores, target_ratio=self.merge_ratio)
+                if current_encoder is not None:
+                    # Apply same merge mask to encoder
+                    B_curr, P_curr, D_curr = current_encoder.shape
+                    merge_mask_encoder = merge_mask[:, :P_curr] if merge_mask.shape[1] >= P_curr else merge_mask
+                    current_encoder, _ = self.local_ctm(current_encoder, importance_scores[:, :P_curr] if importance_scores.shape[1] >= P_curr else importance_scores, target_ratio=self.merge_ratio)
+                
+                # Store merge mask M[s]
+                merge_masks.append(merge_mask)
+                current_size = current_hidden.shape[1]
+        
+        return current_hidden, stage_outputs, merge_masks
+
+    def multi_stage_token_aggregation(self, final_hidden: torch.Tensor, stage_outputs: List[torch.Tensor], merge_masks: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Multi-Stage Token Aggregation (MTA) for upsampling.
+        
+        Algorithm 2 Part 2: Multi-stage Token Aggregation
+        H_agg ← H_{t,LS}
+        For s = S-1 down to 1:
+            H_agg ← Unpool(H_agg, M[s])
+            H_agg ← H_agg + Z[s]
+        
+        Args:
+            final_hidden: [B, P_final, D] final hidden states from last stage
+            stage_outputs: List of [B, P_s, D] outputs Z[s] for each stage
+            merge_masks: List of [B, P_s] merge masks M[s] for each stage
+            
+        Returns:
+            aggregated: [B, P_initial, D] aggregated hidden states
+        """
+        # Start with final stage output
+        H_agg = final_hidden
+        
+        # Aggregate from last stage to first (reverse order)
+        for s in range(len(stage_outputs) - 2, -1, -1):  # S-1 down to 1
+            # Unpool to match stage s size
+            stage_size = stage_outputs[s].shape[1]
+            H_agg = self.unpool_tokens(H_agg, merge_masks[s], stage_size)
+            
+            # Add stage output: H_agg ← H_agg + Z[s]
+            # Ensure shapes match
+            if H_agg.shape[1] == stage_outputs[s].shape[1]:
+                H_agg = H_agg + stage_outputs[s]
+            else:
+                # If sizes don't match, interpolate
+                if H_agg.shape[1] < stage_outputs[s].shape[1]:
+                    # Upsample H_agg to match stage_outputs[s]
+                    H_agg = F.interpolate(H_agg.transpose(1, 2), size=stage_outputs[s].shape[1], mode='linear', align_corners=False).transpose(1, 2)
+                else:
+                    # Downsample stage_outputs[s] to match H_agg
+                    stage_interp = F.interpolate(stage_outputs[s].transpose(1, 2), size=H_agg.shape[1], mode='linear', align_corners=False).transpose(1, 2)
+                    H_agg = H_agg + stage_interp
+        
+        return H_agg
+
     def enhanced_process_blocks(self, start_idx: int, hidden: torch.Tensor, encoder: torch.Tensor, *args, **kwargs):
         """
         增强的块处理算法，结合块级和token级线性近似，且可选执行 AdaCorrection 纠偏插值
+        如果启用Token Merging，则使用多阶段金字塔编码
         """
+        # 如果启用Token Merging，使用多阶段金字塔编码
+        if self.enable_token_merge:
+            final_hidden, stage_outputs, merge_masks = self.multi_stage_pyramidal_encoding(hidden, encoder, *args, **kwargs)
+            aggregated_hidden = self.multi_stage_token_aggregation(final_hidden, stage_outputs, merge_masks)
+            
+            # 处理single_transformer_blocks（如果存在）
+            if self.single_transformer_blocks and encoder is not None:
+                aggregated_hidden = torch.cat([encoder, aggregated_hidden], dim=1)
+                for block in self.single_transformer_blocks:
+                    aggregated_hidden = block(aggregated_hidden, *args, **kwargs)
+                encoder, aggregated_hidden = aggregated_hidden.split([encoder.shape[1], aggregated_hidden.shape[1] - encoder.shape[1]], dim=1)
+            
+            return aggregated_hidden, encoder
+        
         if not self.enable_enhanced_linear_approx and not self.enable_adacorrection:
             return self.process_blocks(start_idx, hidden, encoder, *args, **kwargs)
         
@@ -658,10 +1039,18 @@ class FastCachedTransformerBlocks(CachedTransformerBlocks):
         return hidden_states, prev_hidden_states, hidden_states, encoder_hidden_states
     
     def process_blocks(self, start_idx: int, hidden: torch.Tensor, encoder: torch.Tensor, *args, **kwargs):
-        """Override to implement space-time FastCache"""
+        """Override to implement space-time FastCache with optional AdaCorrection and Token Merging"""
+        # 如果启用了Token Merging，使用多阶段金字塔编码（在enhanced_process_blocks中处理）
+        if self.enable_token_merge:
+            return self.enhanced_process_blocks(start_idx, hidden, encoder, *args, **kwargs)
+        
         # 如果启用了增强线性近似算法，使用增强版本
         if self.enable_enhanced_linear_approx:
             return self.enhanced_process_blocks(start_idx, hidden, encoder, *args, **kwargs)
+        
+        # 如果启用AdaCorrection，使用AdaCorrection处理流程
+        if self.enable_adacorrection:
+            return self.process_transformer_blocks(start_idx, hidden, encoder, *args, **kwargs)
         
         # 如果使用transformer级缓存，直接使用线性投影
         if self.use_cache:
@@ -730,12 +1119,7 @@ class FastCachedTransformerBlocks(CachedTransformerBlocks):
                 correction_weight = torch.clamp(self.adacorr_gamma * offset_score, 0.0, 1.0)
                 
                 # 自适应混合: ĥ_{t,l+1} = (1 - λ_t^l) * h̃_{t,l+1} + λ_t^l * h_{t,l+1}
-                # 将correction_weight广播到hidden的维度
-                if correction_weight.dim() == 0:
-                    correction_weight = correction_weight.view(1, 1, 1)
-                elif correction_weight.dim() == 1:
-                    correction_weight = correction_weight.view(-1, 1, 1)
-                
+                # correction_weight is a scalar, so we can directly use it for blending
                 current_hidden = (1 - correction_weight) * cached_hidden + correction_weight * fresh_hidden
                 current_encoder = fresh_encoder
                 

@@ -127,6 +127,96 @@ Output:
 4. Return H_t^L
 ```
 
+## Spatial-Temporal Token Merging
+
+FastCache includes an advanced **Multi-Stage Spatial-Temporal Token Merging** mechanism that further reduces computational redundancy by intelligently merging tokens based on both spatial density and temporal saliency.
+
+### Token Importance Metric
+
+The token merging algorithm uses a multi-criteria importance metric that considers:
+
+1. **Spatial Density** (ρsp,i): Measures how centrally located a token is within a dense feature cluster
+   ```
+   ρsp,i = exp(-1/K * Σ_{j∈kNN(i)} ||ht,i - ht,j||²)
+   ```
+   where kNN(i) denotes the K nearest neighbors for token i.
+
+2. **Temporal Saliency** (ρtm,i): Captures motion dynamics between timesteps
+   ```
+   ρtm,i = ||ht,i - ht-1,i||₂
+   ```
+
+3. **Combined Importance Score** (Si): Unifies spatial and temporal metrics
+   ```
+   Si = ρsp,i · (1 + λ · ρtm,i)
+   ```
+   where λ modulates the influence of temporal changes.
+
+### Local Clustering-based Token Merge (LocalCTM)
+
+Tokens are grouped into clusters, and tokens within each cluster Ck are merged into a single representative token via weighted averaging:
+
+```
+h̃_k = Σ_{j∈Ck} (Sj * ht,j) / Σ_{j∈Ck} Sj
+```
+
+This ensures that tokens are preserved if they are either spatially representative or contain significant temporal updates.
+
+### Multi-Stage Pyramidal Encoding
+
+FastCache implements a multi-stage pyramidal backbone encoding process:
+
+**Algorithm 2: Multi-Stage Spatial-Temporal Caching with Token Merging**
+
+```
+Part 1: Pyramidal Backbone Encoding
+For s = 1 to S:
+    For l = 1 to Ls:
+        δ_{t,l} ← ||H_{t,l-1} - H_{t-1,l-1}||_F / ||H_{t-1,l-1}||_F
+        If δ²_{t,l} ≤ χ²_{ND,1-α}/(ND):
+            H_{t,l} ← W_{s,l} H_{t,l-1} + b_{s,l}  {Linear Approximation}
+        Else:
+            H_{t,l} ← Blocks,l(H_{t,l-1})  {Full computation}
+    Z[s] ← H_{t,Ls}
+    If s < S:
+        // CTM Downsampling
+        Compute importance scores S
+        H_{t,0}, M[s] ← LocalCTM(H_{t,Ls}, S)
+        
+Part 2: Multi-stage Token Aggregation (MTA)
+H_agg ← H_{t,LS}
+For s = S-1 down to 1:
+    H_agg ← Unpool(H_agg, M[s])
+    H_agg ← H_agg + Z[s]
+H_final ← H_agg
+```
+
+### Usage: Token Merging
+
+```python
+from xfuser.model_executor.cache.diffusers_adapters.flux import apply_cache_on_transformer
+
+# Enable token merging with FastCache
+apply_cache_on_transformer(
+    transformer,
+    use_cache="Fast",
+    enable_token_merge=True,      # Enable token merging
+    token_merge_k=5,              # Number of nearest neighbors for spatial density
+    token_merge_lambda=1.0,      # Temporal saliency weight
+    num_stages=3,                # Number of pyramidal stages
+    merge_ratio=0.5,             # Token reduction ratio per stage
+    motion_threshold=0.1,
+    rel_l1_thresh=0.05,
+)
+```
+
+### Benefits of Token Merging
+
+- **Progressive Token Reduction**: Each stage reduces token count while preserving important information
+- **Multi-Scale Processing**: Captures both fine-grained and coarse-grained features
+- **Adaptive Merging**: Importance-based merging ensures critical tokens are preserved
+- **Quality Preservation**: Multi-stage aggregation restores full resolution with minimal quality loss
+
 ## Key Advantages of Linear Approximation Approach
 
 - **Computational Efficiency**: Linear operations (O(d)) replace quadratic attention computations (O(d²))
