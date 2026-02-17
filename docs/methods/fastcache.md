@@ -344,16 +344,23 @@ result = paralleler(...)  # Benefits from both linear approximation and parallel
 If you use FastCache's linear approximation framework in your research, please cite:
 
 ```bibtex
-@inproceedings{liu2025fastcache,
-  title={FastCache: Cache What Matters, Skip What Doesn't.},
-  author={Liu, Dong and Zhang, Jiayi and Li, Yifan and Yu, Yanxuan and Lengerich, Ben and Wu, Ying Nian},
-  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR) Workshops},
-  year={2025}
-}
 @article{liu2025fastcache,
-  title={FastCache: Fast Caching for Diffusion Transformer Through Learnable Linear Approximation},
-  author={Liu, Dong and Zhang, Jiayi and Li, Yifan and Yu, Yanxuan and Lengerich, Ben and Wu, Ying Nian},
-  journal={arXiv preprint arXiv:2505.20353},
-  year={2025}
+      title={FastCache: Fast Caching for Diffusion Transformer Through Learnable Linear Approximation}, 
+      author={Dong Liu and Yanxuan Yu and Jiayi Zhang and Yifan Li and Ben Lengerich and Ying Nian Wu},
+      year={2025},
+      eprint={2505.20353},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2505.20353}, 
+}
+
+@article{liu2026adacorrect,
+      title={AdaCorrection: Adaptive Offset Cache Correction for Accurate Diffusion Transformers}, 
+      author={Dong Liu and Yanxuan Yu and Ben Lengerich and Ying Nian Wu},
+      year={2026},
+      eprint={2602.13357},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2602.13357}, 
 }
 ```
