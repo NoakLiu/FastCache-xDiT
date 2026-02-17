@@ -456,4 +456,4 @@ If you use FastCache-xDiT in your research or applications, please cite:
 
 ## Contact
 
-For questions about FastCache-xDiT, please contact [dong.liu.dl2367@yale.edu](mailto:dong.liu.dl2367@yale.edu).
+For questions about FastCache-xDiT, please contact [pikeliu.mlsys@gmail.com](mailto:pikeliu.mlsys@gmail.com).
