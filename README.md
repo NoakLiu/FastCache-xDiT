@@ -257,6 +257,24 @@ python examples/test_adacorrection.py \
 
 For detailed documentation, see [AdaCorrection Documentation](./docs/methods/adacorrection.md).
 
+#### Frequency-domain diffusion and error-feedback caching
+
+Companion manuscript: **Accelerating Frequency Domain Diffusion Models with Error-Feedback Event-Driven Caching**; see [Frequency-domain diffusion & error-feedback caching](./docs/methods/frequency_domain_error_feedback_caching.md).
+
+In code, FastCache supports an optional path that (1) measures normalized change of hidden states in the **token-sequence rFFT domain** as an event signal and (2) maintains a spectral **EMA of `(fresh − cached)`** and adds its inverse FFT back as **error feedback**, combined with cached versus fresh blending (and optionally merged with AdaCorrection via `max` of the two weights).
+
+```bash
+python examples/test_freq_error_feedback.py \
+    --model "black-forest-labs/FLUX.1-schnell" \
+    --prompt "a serene landscape with mountains and a lake" \
+    --num_inference_steps 30 \
+    --enable_adacorrection \
+    --freq_event_gamma 2.0 \
+    --freq_error_ema_decay 0.85
+```
+
+Programmatically (Flux adapter), pass `enable_freq_error_feedback=True` with optional `freq_event_gamma` and `freq_error_ema_decay` into `apply_cache_on_transformer` together with `use_cache="Fast"`.
+
 #### Enhanced Linear Approximation Algorithm
 
 Test the enhanced Linear Approximation Algorithm:
@@ -451,6 +469,12 @@ If you use FastCache-xDiT in your research or applications, please cite:
       archivePrefix={arXiv},
       primaryClass={cs.CV},
       url={https://arxiv.org/abs/2602.13357}, 
+}
+
+@misc{liu2026frequencydiffusioncaching,
+      title={Accelerating Frequency Domain Diffusion Models with Error-Feedback Event-Driven Caching},
+      author={Dong Liu and Haisheng Wang and Yanxuan Yu},
+      year={2026}
 }
 ```
 

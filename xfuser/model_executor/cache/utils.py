@@ -274,6 +274,9 @@ class FastCachedTransformerBlocks(CachedTransformerBlocks):
         enable_adacorrection: bool = False,  # 新增：是否启用AdaCorrection
         adacorr_gamma: float = 1.0,          # 新增：灵敏度 γ
         adacorr_lambda: float = 1.0,         # 新增：空间项权重 λ
+        enable_freq_error_feedback: bool = False,  # FFT event score + spectral EMA of (fresh - cached) feedback
+        freq_event_gamma: float = 2.0,     # scales normalized FFT change into blend weight toward fresh output
+        freq_error_ema_decay: float = 0.85,  # EMA decay for complex spectrum of (fresh - cached)
         enable_token_merge: bool = False,    # 新增：是否启用Token Merging
         token_merge_k: int = 5,              # 新增：kNN的K值
         token_merge_lambda: float = 1.0,     # 新增：时间项权重λ（与adacorr_lambda不同）
@@ -355,6 +358,16 @@ class FastCachedTransformerBlocks(CachedTransformerBlocks):
             self.register_buffer("adacorr_cache", None, persistent=False)
             self.register_buffer("adacorr_cache_timestep", None, persistent=False)
             print(f"AdaCorrection enabled with gamma={adacorr_gamma}, lambda={adacorr_lambda}")
+
+        self.enable_freq_error_feedback = enable_freq_error_feedback
+        self.freq_event_gamma = freq_event_gamma
+        self.freq_error_ema_decay = freq_error_ema_decay
+        self.register_buffer("_freq_error_ema", None, persistent=False)
+        if self.enable_freq_error_feedback:
+            print(
+                f"Frequency-domain error-feedback caching enabled: "
+                f"freq_event_gamma={freq_event_gamma}, freq_error_ema_decay={freq_error_ema_decay}"
+            )
         
         # 新增：Token Merging 参数
         self.enable_token_merge = enable_token_merge
@@ -509,6 +522,40 @@ class FastCachedTransformerBlocks(CachedTransformerBlocks):
         while lam.dim() < fresh_hidden.dim():
             lam = lam.unsqueeze(0)
         return (1 - lam) * cached_hidden + lam * fresh_hidden
+
+    def compute_freq_event_score(self, current_hidden: torch.Tensor, prev_hidden: torch.Tensor) -> torch.Tensor:
+        """
+        rFFT along the token sequence (dim=1); normalized magnitude change is the event score
+        (larger => higher weight on the fresh block output).
+        """
+        if prev_hidden is None:
+            return torch.tensor(0.0, device=current_hidden.device, dtype=torch.float32)
+        f_cur = torch.fft.rfft(current_hidden.float(), dim=1, norm="ortho")
+        f_prev = torch.fft.rfft(prev_hidden.float(), dim=1, norm="ortho")
+        diff = (f_cur - f_prev).abs().mean()
+        denom = f_prev.abs().mean().clamp(min=1e-6)
+        return (diff / denom).to(dtype=torch.float32)
+
+    def spectral_error_feedback_residual(self, seq_len: int, ref: torch.Tensor) -> torch.Tensor:
+        """irFFT of spectral EMA back to token domain; add to hidden states (error feedback)."""
+        if not self.enable_freq_error_feedback or self._freq_error_ema is None:
+            return torch.zeros_like(ref)
+        ema = self._freq_error_ema
+        B, P, D = ref.shape
+        if ema.shape[0] != B or ema.shape[2] != D or ema.shape[1] != (P // 2 + 1):
+            return torch.zeros_like(ref)
+        out = torch.fft.irfft(ema.to(torch.float32), n=seq_len, dim=1, norm="ortho")
+        return out.to(dtype=ref.dtype)
+
+    def update_freq_error_ema(self, delta_hidden: torch.Tensor) -> None:
+        """Update spectral EMA from rFFT(fresh - cached) along the token axis."""
+        if not self.enable_freq_error_feedback:
+            return
+        spec = torch.fft.rfft(delta_hidden.detach().float(), dim=1, norm="ortho")
+        decay = self.freq_error_ema_decay
+        if self._freq_error_ema is None or self._freq_error_ema.shape != spec.shape:
+            self.register_buffer("_freq_error_ema", torch.zeros_like(spec), persistent=False)
+        self._freq_error_ema.mul_(decay).add_(spec, alpha=(1.0 - decay))
 
     def compute_spatial_density(self, hidden_states: torch.Tensor, k: int = None) -> torch.Tensor:
         """
@@ -875,7 +922,7 @@ class FastCachedTransformerBlocks(CachedTransformerBlocks):
             
             return aggregated_hidden, encoder
         
-        if not self.enable_enhanced_linear_approx and not self.enable_adacorrection:
+        if not self.enable_enhanced_linear_approx and not self.enable_adacorrection and not self.enable_freq_error_feedback:
             return self.process_blocks(start_idx, hidden, encoder, *args, **kwargs)
         
         # 获取previous hidden states
@@ -903,10 +950,20 @@ class FastCachedTransformerBlocks(CachedTransformerBlocks):
             fresh_hidden_i, fresh_encoder_i = block(current_hidden, current_encoder, *args, **kwargs)
             fresh_hidden_i, fresh_encoder_i = (fresh_hidden_i, fresh_encoder_i) if self.return_hidden_states_first else (fresh_encoder_i, fresh_hidden_i)
             
-            if self.enable_adacorrection and prev_hidden_states is not None:
-                # 计算偏移分数并进行插值
-                offset_score = self.compute_adacorr_offset_score(current_hidden, prev_hidden_states)
-                blended_hidden = self.blend_with_adacorrection(cached_hidden_i, fresh_hidden_i, offset_score)
+            if (self.enable_adacorrection or self.enable_freq_error_feedback) and prev_hidden_states is not None:
+                w = torch.zeros((), device=current_hidden.device, dtype=torch.float32)
+                if self.enable_adacorrection:
+                    offset_score = self.compute_adacorr_offset_score(current_hidden, prev_hidden_states)
+                    w = torch.maximum(w, torch.clamp(self.adacorr_gamma * offset_score, 0.0, 1.0))
+                if self.enable_freq_error_feedback:
+                    freq_score = self.compute_freq_event_score(current_hidden, prev_hidden_states)
+                    w = torch.maximum(w, torch.clamp(self.freq_event_gamma * freq_score, 0.0, 1.0))
+                while w.dim() < fresh_hidden_i.dim():
+                    w = w.unsqueeze(0)
+                corr = self.spectral_error_feedback_residual(current_hidden.shape[1], current_hidden)
+                blended_hidden = (1.0 - w) * cached_hidden_i + w * fresh_hidden_i + corr
+                if self.enable_freq_error_feedback:
+                    self.update_freq_error_ema(fresh_hidden_i - cached_hidden_i)
                 current_hidden, current_encoder = blended_hidden, fresh_encoder_i
             else:
                 # 若未启用 AdaCorrection，则依据增强线性近似的判定决定
@@ -1048,8 +1105,8 @@ class FastCachedTransformerBlocks(CachedTransformerBlocks):
         if self.enable_enhanced_linear_approx:
             return self.enhanced_process_blocks(start_idx, hidden, encoder, *args, **kwargs)
         
-        # 如果启用AdaCorrection，使用AdaCorrection处理流程
-        if self.enable_adacorrection:
+        # AdaCorrection or frequency-domain error-feedback: per-block cached vs fresh blend path
+        if self.enable_adacorrection or self.enable_freq_error_feedback:
             return self.process_transformer_blocks(start_idx, hidden, encoder, *args, **kwargs)
         
         # 如果使用transformer级缓存，直接使用线性投影
@@ -1097,36 +1154,38 @@ class FastCachedTransformerBlocks(CachedTransformerBlocks):
         return self.process_transformer_blocks(start_idx, hidden, encoder, *args, **kwargs)
     
     def process_transformer_blocks(self, start_idx: int, hidden: torch.Tensor, encoder: torch.Tensor, *args, **kwargs):
-        """Process hidden states through transformer blocks with per-block caching and optional AdaCorrection"""
+        """Process hidden states through transformer blocks with per-block caching and optional AdaCorrection / frequency feedback."""
         current_hidden, current_encoder = hidden, encoder
         prev_hidden = self.cache_context.prev_hidden_states
         
         # 对每个transformer块分别决定是否使用缓存
         for i, block in enumerate(self.transformer_blocks[start_idx:], start=start_idx):
-            # 如果启用AdaCorrection，使用自适应混合策略
-            if self.enable_adacorrection and prev_hidden is not None:
-                # 计算cached路径（线性近似）
+            use_blend = prev_hidden is not None and (
+                self.enable_adacorrection or self.enable_freq_error_feedback
+            )
+            if use_blend:
                 cached_hidden = self.block_projections[i](current_hidden)
-                
-                # 计算fresh路径（完整transformer块）
                 fresh_hidden, fresh_encoder = block(current_hidden, current_encoder, *args, **kwargs)
                 fresh_hidden, fresh_encoder = (fresh_hidden, fresh_encoder) if self.return_hidden_states_first else (fresh_encoder, fresh_hidden)
-                
-                # 计算offset score S_t^l
-                offset_score = self.compute_adacorr_offset_score(current_hidden, prev_hidden)
-                
-                # 计算correction weight λ_t^l = clip(γ * S_t^l, 0, 1)
-                correction_weight = torch.clamp(self.adacorr_gamma * offset_score, 0.0, 1.0)
-                
-                # 自适应混合: ĥ_{t,l+1} = (1 - λ_t^l) * h̃_{t,l+1} + λ_t^l * h_{t,l+1}
-                # correction_weight is a scalar, so we can directly use it for blending
-                current_hidden = (1 - correction_weight) * cached_hidden + correction_weight * fresh_hidden
+
+                w = torch.zeros((), device=current_hidden.device, dtype=torch.float32)
+                if self.enable_adacorrection:
+                    offset_score = self.compute_adacorr_offset_score(current_hidden, prev_hidden)
+                    w = torch.maximum(w, torch.clamp(self.adacorr_gamma * offset_score, 0.0, 1.0))
+                if self.enable_freq_error_feedback:
+                    freq_score = self.compute_freq_event_score(current_hidden, prev_hidden)
+                    w = torch.maximum(w, torch.clamp(self.freq_event_gamma * freq_score, 0.0, 1.0))
+
+                corr = self.spectral_error_feedback_residual(current_hidden.shape[1], current_hidden)
+                while w.dim() < current_hidden.dim():
+                    w = w.unsqueeze(0)
+                current_hidden = (1.0 - w) * cached_hidden + w * fresh_hidden + corr
                 current_encoder = fresh_encoder
-                
-                # 更新prev_hidden为当前层的输出，用于下一层的计算
+                if self.enable_freq_error_feedback:
+                    self.update_freq_error_ema(fresh_hidden - cached_hidden)
                 prev_hidden = current_hidden.detach().clone()
-                
-            # 如果未启用AdaCorrection，使用原有的FastCache逻辑
+                continue
+
             elif prev_hidden is not None:
                 # 计算相对变化
                 delta = self.compute_relative_change(current_hidden, prev_hidden)
@@ -1141,10 +1200,9 @@ class FastCachedTransformerBlocks(CachedTransformerBlocks):
                     continue
             
             # 完整执行transformer处理（当不使用缓存时）
-            if not (self.enable_adacorrection and prev_hidden is not None):
-                current_hidden, current_encoder = block(current_hidden, current_encoder, *args, **kwargs)
-                current_hidden, current_encoder = (current_hidden, current_encoder) if self.return_hidden_states_first else (current_encoder, current_hidden)
-                prev_hidden = current_hidden.detach().clone()
+            current_hidden, current_encoder = block(current_hidden, current_encoder, *args, **kwargs)
+            current_hidden, current_encoder = (current_hidden, current_encoder) if self.return_hidden_states_first else (current_encoder, current_hidden)
+            prev_hidden = current_hidden.detach().clone()
         
         # 处理single_transformer_blocks如果存在
         if self.single_transformer_blocks:
