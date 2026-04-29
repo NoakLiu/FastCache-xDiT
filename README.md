@@ -259,7 +259,7 @@ For detailed documentation, see [AdaCorrection Documentation](./docs/methods/ada
 
 #### Frequency-domain diffusion and error-feedback caching
 
-Companion manuscript: **Accelerating Frequency Domain Diffusion Models with Error-Feedback Event-Driven Caching**; see [Frequency-domain diffusion & error-feedback caching](./docs/methods/frequency_domain_error_feedback_caching.md).
+Companion paper (**arXiv:2604.22901**): **Accelerating Frequency Domain Diffusion Models with Error-Feedback Event-Driven Caching**; see [Frequency-domain diffusion & error-feedback caching](./docs/methods/frequency_domain_error_feedback_caching.md).
 
 In code, FastCache supports an optional path that (1) measures normalized change of hidden states in the **token-sequence rFFT domain** as an event signal and (2) maintains a spectral **EMA of `(fresh − cached)`** and adds its inverse FFT back as **error feedback**, combined with cached versus fresh blending (and optionally merged with AdaCorrection via `max` of the two weights).
 
@@ -472,9 +472,13 @@ If you use FastCache-xDiT in your research or applications, please cite:
 }
 
 @misc{liu2026frequencydiffusioncaching,
-      title={Accelerating Frequency Domain Diffusion Models with Error-Feedback Event-Driven Caching},
+      title={Accelerating Frequency Domain Diffusion Models with Error-Feedback Event-Driven Caching}, 
       author={Dong Liu and Haisheng Wang and Yanxuan Yu},
-      year={2026}
+      year={2026},
+      eprint={2604.22901},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2604.22901}, 
 }
 ```
 

@@ -1,6 +1,6 @@
 # Frequency-domain error-feedback caching (implementation)
 
-This page descirbes the implementation in FastCache named *frequency-domain error-feedback caching*. It is implemented on **`FastCachedTransformerBlocks`** in `xfuser/model_executor/cache/utils.py` and exposed for **Flux** through `xfuser/model_executor/cache/diffusers_adapters/flux.py` (`apply_cache_on_transformer`, `use_cache="Fast"` only).
+This page describes the implementation in FastCache named *frequency-domain error-feedback caching*. It is implemented on **`FastCachedTransformerBlocks`** in `xfuser/model_executor/cache/utils.py` and exposed for **Flux** through `xfuser/model_executor/cache/diffusers_adapters/flux.py` (`apply_cache_on_transformer`, `use_cache="Fast"` only).
 
 The design is a concrete, DiT-oriented variant: **rFFT along the token sequence** (not a separate time-series axis), plus an **EMA of the spectrum of `(fresh − cached)`** fed back via **irFFT**. It can be composed with **AdaCorrection** by taking the **maximum** of the two scalar blend weights.
 
@@ -120,4 +120,18 @@ apply_cache_on_transformer(
 
 ## Citation
 
-For the manuscript title and BibTeX, see [Cite Us](../../README.md#cite-us) in the repository `README.md`. The code above is an engineering realization aligned with that line of work, not a line-by-line reproduction of the LaTeX manuscript.
+If you use this caching method, cite:
+
+```bibtex
+@misc{liu2026frequencydiffusioncaching,
+      title={Accelerating Frequency Domain Diffusion Models with Error-Feedback Event-Driven Caching}, 
+      author={Dong Liu and Haisheng Wang and Yanxuan Yu},
+      year={2026},
+      eprint={2604.22901},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2604.22901}, 
+}
+```
+
+FastCache-xDiT and related papers are listed under [Cite Us](../../README.md#cite-us) in the root `README.md`.
