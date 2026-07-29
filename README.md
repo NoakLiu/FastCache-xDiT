@@ -452,33 +452,24 @@ If you use FastCache-xDiT in your research or applications, please cite:
 
 ```bibtex
 @article{liu2025fastcache,
-      title={FastCache: Fast Caching for Diffusion Transformer Through Learnable Linear Approximation}, 
-      author={Dong Liu and Yanxuan Yu and Jiayi Zhang and Yifan Li and Ben Lengerich and Ying Nian Wu},
-      year={2025},
-      eprint={2505.20353},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2505.20353}, 
+  title={Fastcache: Fast caching for diffusion transformer through learnable linear approximation},
+  author={Liu, Dong and Yu, Yanxuan and Zhang, Jiayi and Li, Yifan and Lengerich, Ben and Wu, Ying Nian},
+  journal={arXiv preprint arXiv:2505.20353},
+  year={2025}
 }
 
-@article{liu2026adacorrect,
-      title={AdaCorrection: Adaptive Offset Cache Correction for Accurate Diffusion Transformers}, 
-      author={Dong Liu and Yanxuan Yu and Ben Lengerich and Ying Nian Wu},
-      year={2026},
-      eprint={2602.13357},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2602.13357}, 
+@article{liu2026adacorrection,
+  title={AdaCorrection: Adaptive Offset Cache Correction for Accurate Diffusion Transformers},
+  author={Liu, Dong and Yu, Yanxuan and Lengerich, Ben and Wu, Ying Nian},
+  journal={arXiv preprint arXiv:2602.13357},
+  year={2026}
 }
 
-@misc{liu2026frequencydiffusioncaching,
-      title={Accelerating Frequency Domain Diffusion Models with Error-Feedback Event-Driven Caching}, 
-      author={Dong Liu and Haisheng Wang and Yanxuan Yu},
-      year={2026},
-      eprint={2604.22901},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2604.22901}, 
+@article{liu2026fdiff,
+  title={Accelerating Frequency Domain Diffusion Models with Error-Feedback Event-Driven Caching},
+  author={Liu, Dong and Yu, Yanxuan and Wu, Ying Nian},
+  journal={arXiv preprint arXiv:2604.22901},
+  year={2026}
 }
 ```
 
