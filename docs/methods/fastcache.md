@@ -354,13 +354,11 @@ If you use FastCache's linear approximation framework in your research, please c
       url={https://arxiv.org/abs/2505.20353}, 
 }
 
-@article{liu2026adacorrect,
+@inproceedings{liu2026adacorrect,
       title={AdaCorrection: Adaptive Offset Cache Correction for Accurate Diffusion Transformers}, 
       author={Dong Liu and Yanxuan Yu and Ben Lengerich and Ying Nian Wu},
-      year={2026},
-      eprint={2602.13357},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2602.13357}, 
+      booktitle={IEEE International Conference on Image Processing (ICIP)},
+      note={Oral Presentation},
+      year={2026}
 }
 ```

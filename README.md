@@ -235,6 +235,8 @@ python examples/run_fastcache_test.py \
 
 #### AdaCorrection: Adaptive Offset Cache Correction
 
+Companion paper (**ICIP 2026 Oral**): **AdaCorrection: Adaptive Offset Cache Correction for Accurate Diffusion Transformers**.
+
 AdaCorrection is a lightweight, training-free framework that improves generation quality by adaptively correcting cache misalignment. It can be used with FastCache or other caching methods:
 
 ```bash
@@ -458,10 +460,11 @@ If you use FastCache-xDiT in your research or applications, please cite:
   year={2025}
 }
 
-@article{liu2026adacorrection,
+@inproceedings{liu2026adacorrection,
   title={AdaCorrection: Adaptive Offset Cache Correction for Accurate Diffusion Transformers},
   author={Liu, Dong and Yu, Yanxuan and Lengerich, Ben and Wu, Ying Nian},
-  journal={arXiv preprint arXiv:2602.13357},
+  booktitle={IEEE International Conference on Image Processing (ICIP)},
+  note={Oral Presentation},
   year={2026}
 }
 

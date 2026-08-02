@@ -279,3 +279,17 @@ AdaCorrection provides consistent improvements across different model architectu
 - **Dynamic Parameter Adaptation**: Real-time adaptation of γ and λ based on content complexity
 - **Cross-Modal Extension**: Extending AdaCorrection to video and 3D generation models
 
+## Citation
+
+AdaCorrection is accepted as an **Oral** presentation at **ICIP 2026**. If you use AdaCorrection in your research, please cite:
+
+```bibtex
+@inproceedings{liu2026adacorrection,
+  title={AdaCorrection: Adaptive Offset Cache Correction for Accurate Diffusion Transformers},
+  author={Liu, Dong and Yu, Yanxuan and Lengerich, Ben and Wu, Ying Nian},
+  booktitle={IEEE International Conference on Image Processing (ICIP)},
+  note={Oral Presentation},
+  year={2026}
+}
+```
+
